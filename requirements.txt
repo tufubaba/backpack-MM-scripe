@@ -1,0 +1,5 @@
+requests
+websocket-client
+python-decimal
+python-dotenv
+pynacl
