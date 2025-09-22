@@ -2,9 +2,10 @@
 # -*- coding: utf-8 -*-
 
 import os, json, time, signal, threading, base64
+from collections import deque
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, InvalidOperation, getcontext
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Deque
 
 import requests
 from websocket import WebSocketApp
@@ -55,6 +56,20 @@ HEDGE_STEP_BPS  = Decimal(os.getenv("HEDGE_STEP_BPS",  "5"))
 HEDGE_MAX_STEPS = int(os.getenv("HEDGE_MAX_STEPS", "4"))
 HEDGE_COOLDOWN_MS = int(os.getenv("HEDGE_COOLDOWN_MS", "1500"))
 HEDGE_GRACE_MS    = int(os.getenv("HEDGE_GRACE_MS",    "2000"))
+
+# 自适应 & 深度数据参数
+ADAPTIVE_SPREAD          = os.getenv("ADAPTIVE_SPREAD", "false").lower() == "true"
+ADAPTIVE_HEDGE           = os.getenv("ADAPTIVE_HEDGE", "false").lower() == "true"
+DEPTH_LEVELS             = int(os.getenv("DEPTH_LEVELS", "5"))
+DEPTH_STALE_MS           = int(os.getenv("DEPTH_STALE_MS", "3000"))
+TRADE_WINDOW_SEC         = int(os.getenv("TRADE_WINDOW_SEC", "5"))
+TRADE_STALE_MS           = int(os.getenv("TRADE_STALE_MS", "4000"))
+LIQUIDITY_TARGET_VOLUME  = Decimal(os.getenv("LIQUIDITY_TARGET_VOLUME", "500"))
+LIQUIDITY_VOLUME_STEP    = Decimal(os.getenv("LIQUIDITY_VOLUME_STEP", "100"))
+IMBALANCE_THRESHOLD      = Decimal(os.getenv("IMBALANCE_THRESHOLD", "0.25"))
+IMBALANCE_TICK_IMPACT    = int(os.getenv("IMBALANCE_TICK_IMPACT", "1"))
+DEPTH_STREAM_PREFIX      = os.getenv("DEPTH_STREAM_PREFIX", "orderbook")
+TRADE_STREAM_PREFIX      = os.getenv("TRADE_STREAM_PREFIX", "trade")
 
 # ---------------------- 私钥 & 会话 ----------------------
 def _load_signing_key():
@@ -128,6 +143,107 @@ class MarketFilters:
     step: Decimal
     min_qty: Decimal
     max_qty: Optional[Decimal]
+
+
+@dataclass
+class DepthMetrics:
+    ts_ms: int
+    total_bid: Decimal
+    total_ask: Decimal
+    best_bid: Decimal
+    best_ask: Decimal
+
+
+@dataclass
+class TradeEvent:
+    ts_ms: int
+    qty: Decimal
+    side: str  # "buy" or "sell"
+
+
+@dataclass
+class TradeStats:
+    ts_ms: int
+    buy_volume: Decimal
+    sell_volume: Decimal
+
+    @property
+    def total_volume(self) -> Decimal:
+        return self.buy_volume + self.sell_volume
+
+    @property
+    def imbalance(self) -> Decimal:
+        denom = self.total_volume
+        if denom == 0:
+            return Decimal("0")
+        return (self.buy_volume - self.sell_volume) / denom
+
+
+def _calc_liquidity_steps(total_bid: Decimal, total_ask: Decimal) -> int:
+    if LIQUIDITY_TARGET_VOLUME <= 0 or LIQUIDITY_VOLUME_STEP <= 0:
+        return 0
+    min_depth = min(total_bid, total_ask)
+    if min_depth >= LIQUIDITY_TARGET_VOLUME:
+        return 0
+    deficit = LIQUIDITY_TARGET_VOLUME - min_depth
+    steps = int((deficit / LIQUIDITY_VOLUME_STEP).to_integral_value(rounding=ROUND_UP))
+    return max(0, steps)
+
+
+def adaptive_offsets(bid_offset: int, ask_offset: int,
+                     depth: Optional[DepthMetrics],
+                     trades: Optional[TradeStats]) -> tuple[int, int]:
+    out_bid = bid_offset
+    out_ask = ask_offset
+
+    if depth is not None:
+        extra = _calc_liquidity_steps(depth.total_bid, depth.total_ask)
+        if extra > 0:
+            out_bid += extra
+            out_ask += extra
+
+    if trades is not None and trades.total_volume > 0 and IMBALANCE_TICK_IMPACT > 0:
+        imb = trades.imbalance
+        threshold = IMBALANCE_THRESHOLD
+        if threshold < 0:
+            threshold = Decimal("0")
+        if imb >= threshold:
+            out_bid = max(0, out_bid - IMBALANCE_TICK_IMPACT)
+            out_ask += IMBALANCE_TICK_IMPACT
+        elif imb <= -threshold:
+            out_ask = max(0, out_ask - IMBALANCE_TICK_IMPACT)
+            out_bid += IMBALANCE_TICK_IMPACT
+
+    return out_bid, out_ask
+
+
+def adaptive_hedge_params(base_start: Decimal, base_step: Decimal, pos: Decimal,
+                          depth: Optional[DepthMetrics], trades: Optional[TradeStats]) -> tuple[Decimal, Decimal]:
+    start = base_start
+    step = base_step
+
+    if depth is not None and depth.total_bid >= 0 and depth.total_ask >= 0:
+        extra = _calc_liquidity_steps(depth.total_bid, depth.total_ask)
+        if extra > 0:
+            # Liquidity thin → hedge sooner and increase follow-up aggressiveness
+            adj = Decimal(extra)
+            start = max(Decimal("1"), start - adj * base_step)
+            step = max(Decimal("1"), step + adj)
+
+    if trades is not None and trades.total_volume > 0:
+        imb = trades.imbalance
+        if pos > 0:
+            if imb < Decimal("0"):
+                start = max(Decimal("1"), start - base_step)
+            elif imb > Decimal("0"):
+                start = start + base_step
+        elif pos < 0:
+            if imb > Decimal("0"):
+                start = max(Decimal("1"), start - base_step)
+            elif imb < Decimal("0"):
+                start = start + base_step
+
+    return start, step
 
 def _to_decimal_safe(v, default=None):
     if v is None:
@@ -278,6 +394,11 @@ class WSBookTicker:
         self.last_quote_ms: int = 0
         # 仓位（来自私有流；未启用时保持0）
         self.pos_net: Decimal = Decimal("0")
+        # 深度 / 成交统计
+        self.depth_metrics: Optional[DepthMetrics] = None
+        self.depth_levels: int = DEPTH_LEVELS
+        self.recent_trades: Deque[TradeEvent] = deque()
+        self.trade_stats: Optional[TradeStats] = None
         # 对冲状态
         self.last_hedge_ms: int = 0
         self.hedge_step: int = 0
@@ -286,11 +407,18 @@ class WSBookTicker:
     def start(self):
         import ssl
         stream_pub = f"bookTicker.{self.symbol}"
+        stream_depth = f"{DEPTH_STREAM_PREFIX}.{self.symbol}"
+        stream_trade = f"{TRADE_STREAM_PREFIX}.{self.symbol}"
 
         def on_open(ws):
             print("[WS] open")
             # 订阅公共流
-            ws.send(json.dumps({"method": "SUBSCRIBE", "params": [stream_pub], "id": 1}, ensure_ascii=True))
+            public_streams = [stream_pub]
+            if self.depth_levels > 0:
+                public_streams.append(stream_depth)
+            if TRADE_WINDOW_SEC > 0:
+                public_streams.append(stream_trade)
+            ws.send(json.dumps({"method": "SUBSCRIBE", "params": public_streams, "id": 1}, ensure_ascii=True))
             # 订阅私有流（可选）
             if USE_PRIVATE_WS:
                 sig = ws_signature_tuple()
@@ -326,6 +454,16 @@ class WSBookTicker:
                         self.best_bid = b; self.best_bid_qty = B
                         self.last_update_us = ts_us
                     self.maybe_quote()
+                    return
+
+                # order book depth
+                if stream.startswith(DEPTH_STREAM_PREFIX):
+                    self._handle_depth_message(data)
+                    return
+
+                # recent trades
+                if stream.startswith(TRADE_STREAM_PREFIX):
+                    self._handle_trade_message(data)
                     return
 
                 # 私有：仓位更新
@@ -393,6 +531,117 @@ class WSBookTicker:
             return True
         return (time.time() * 1000 - self.last_update_us / 1000.0) > WS_STALE_MS
 
+    # ---- 公共流处理 ----
+    def _handle_depth_message(self, data):
+        bids_raw = data.get("bids") or data.get("b") or []
+        asks_raw = data.get("asks") or data.get("a") or []
+        if not isinstance(bids_raw, list) or not isinstance(asks_raw, list):
+            return
+
+        def _sum_levels(levels):
+            total = Decimal("0")
+            best_price = None
+            count = 0
+            for entry in levels:
+                if count >= self.depth_levels:
+                    break
+                price = None
+                qty = None
+                if isinstance(entry, dict):
+                    price = entry.get("price") or entry.get("p")
+                    qty = entry.get("quantity") or entry.get("q") or entry.get("size")
+                elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                    price, qty = entry[0], entry[1]
+                if price is None or qty is None:
+                    continue
+                try:
+                    price_dec = Decimal(str(price))
+                    qty_dec = Decimal(str(qty))
+                except Exception:
+                    continue
+                if qty_dec <= 0:
+                    continue
+                if best_price is None:
+                    best_price = price_dec
+                total += qty_dec
+                count += 1
+            return total, best_price
+
+        total_bid, best_bid = _sum_levels(bids_raw)
+        total_ask, best_ask = _sum_levels(asks_raw)
+        if total_bid is None or total_ask is None:
+            return
+        ts_ms = int(data.get("t") or data.get("T") or now_ms())
+        with self.lock:
+            self.depth_metrics = DepthMetrics(
+                ts_ms=ts_ms,
+                total_bid=total_bid,
+                total_ask=total_ask,
+                best_bid=best_bid if best_bid is not None else (self.best_bid or Decimal("0")),
+                best_ask=best_ask if best_ask is not None else (self.best_ask or Decimal("0")),
+            )
+        # 深度变化可能影响自适应偏移
+        self.maybe_quote()
+
+    def _handle_trade_message(self, data):
+        now = now_ms()
+        events = data if isinstance(data, list) else [data]
+        updated = False
+
+        for evt in events:
+            qty_raw = evt.get("quantity") or evt.get("q") or evt.get("size") or evt.get("Q")
+            if qty_raw is None:
+                continue
+            try:
+                qty_dec = Decimal(str(qty_raw))
+            except Exception:
+                continue
+            if qty_dec <= 0:
+                continue
+            side_raw = evt.get("side") or evt.get("S")
+            if side_raw is None and "m" in evt:
+                # maker flag: True 表示卖单打到买单（taker 卖）
+                side_raw = "sell" if evt.get("m") else "buy"
+            if side_raw is None:
+                continue
+            side = str(side_raw).lower()
+            if side in ("buy", "bid", "true", "1"):
+                side = "buy"
+            elif side in ("sell", "ask", "false", "0"):
+                side = "sell"
+            else:
+                continue
+            ts_ms = int(evt.get("t") or evt.get("T") or now)
+            trade_event = TradeEvent(ts_ms=ts_ms, qty=qty_dec, side=side)
+            with self.lock:
+                self.recent_trades.append(trade_event)
+                self._prune_trades_locked(now)
+                self._recalc_trade_stats_locked()
+            updated = True
+
+        if updated:
+            self.maybe_quote()
+
+    def _prune_trades_locked(self, now_ms_value: int):
+        cutoff = now_ms_value - TRADE_WINDOW_SEC * 1000
+        while self.recent_trades and self.recent_trades[0].ts_ms < cutoff:
+            self.recent_trades.popleft()
+
+    def _recalc_trade_stats_locked(self):
+        buy_volume = Decimal("0")
+        sell_volume = Decimal("0")
+        latest_ts = 0
+        for evt in self.recent_trades:
+            if evt.side == "buy":
+                buy_volume += evt.qty
+            else:
+                sell_volume += evt.qty
+            if evt.ts_ms > latest_ts:
+                latest_ts = evt.ts_ms
+        if latest_ts == 0:
+            latest_ts = now_ms()
+        self.trade_stats = TradeStats(ts_ms=latest_ts, buy_volume=buy_volume, sell_volume=sell_volume)
+
     # ---- 库存偏移 & 硬阈暂停 ----
     def compute_skew_and_pause(self):
         """
@@ -425,7 +674,8 @@ class WSBookTicker:
         return extra_bid, extra_ask, pause_bid, pause_ask
 
     # ---- 主动 reduceOnly 对冲 ----
-    def maybe_hedge(self):
+    def maybe_hedge(self, depth_snapshot: Optional[DepthMetrics] = None,
+                    trade_snapshot: Optional[TradeStats] = None):
         if HEDGE_TRIGGER <= 0:
             return
         now = int(time.time() * 1000)
@@ -433,9 +683,20 @@ class WSBookTicker:
             pos = self.pos_net
             b = self.best_bid
             a = self.best_ask
+            if depth_snapshot is None:
+                depth_snapshot = self.depth_metrics
+            if trade_snapshot is None:
+                trade_snapshot = self.trade_stats
 
         if b is None or a is None:
             return
+
+        depth_fresh = None
+        if depth_snapshot is not None and now - depth_snapshot.ts_ms <= DEPTH_STALE_MS:
+            depth_fresh = depth_snapshot
+        trade_fresh = None
+        if trade_snapshot is not None and now - trade_snapshot.ts_ms <= TRADE_STALE_MS:
+            trade_fresh = trade_snapshot
 
         # 触发：仓位达到阈值
         if abs(pos) >= HEDGE_TRIGGER:
@@ -460,10 +721,19 @@ class WSBookTicker:
 
         side = "Ask" if pos > 0 else "Bid"  # 净多→卖，净空→买
 
+        hedge_start = HEDGE_START_BPS
+        hedge_step = HEDGE_STEP_BPS
+        if ADAPTIVE_HEDGE:
+            hedge_start, hedge_step = adaptive_hedge_params(hedge_start, hedge_step, pos, depth_fresh, trade_fresh)
+        if hedge_start <= 0:
+            hedge_start = Decimal("1")
+        if hedge_step <= 0:
+            hedge_step = Decimal("1")
+
         if HEDGE_MODE == "market":
             post_order_taker(side=side, qty=qty, mode="market", tif="IOC", reduce_only=True)
         else:
-            cross_bps = HEDGE_START_BPS + Decimal(self.hedge_step) * HEDGE_STEP_BPS
+            cross_bps = hedge_start + Decimal(self.hedge_step) * hedge_step
             if side == "Ask":
                 px = b * (Decimal(1) - cross_bps/Decimal(10000))
                 px = q_price_aggr(px, "Ask")  # 卖向下取整
@@ -484,8 +754,17 @@ class WSBookTicker:
             b = self.best_bid
             a = self.best_ask
             pos = self.pos_net
+            depth_snapshot = self.depth_metrics
+            trade_snapshot = self.trade_stats
         if b is None or a is None or self.stale():
             return
+
+        depth_fresh = None
+        if depth_snapshot is not None and now - depth_snapshot.ts_ms <= DEPTH_STALE_MS:
+            depth_fresh = depth_snapshot
+        trade_fresh = None
+        if trade_snapshot is not None and now - trade_snapshot.ts_ms <= TRADE_STALE_MS:
+            trade_fresh = trade_snapshot
 
         # 点差检查
         spread_ticks = int(((a - b) / FILTERS.tick).to_integral_value(rounding=ROUND_DOWN))
@@ -496,10 +775,16 @@ class WSBookTicker:
         tick = FILTERS.tick
         bid_px = q_price(b, "Bid")
         ask_px = q_price(a, "Ask")
-        if BID_OFFSET_TICKS > 0:
-            bid_px = q_price(bid_px - tick * BID_OFFSET_TICKS, "Bid")
-        if ASK_OFFSET_TICKS > 0:
-            ask_px = q_price(ask_px + tick * ASK_OFFSET_TICKS, "Ask")
+        bid_offset_ticks = BID_OFFSET_TICKS
+        ask_offset_ticks = ASK_OFFSET_TICKS
+
+        if ADAPTIVE_SPREAD:
+            bid_offset_ticks, ask_offset_ticks = adaptive_offsets(bid_offset_ticks, ask_offset_ticks, depth_fresh, trade_fresh)
+
+        if bid_offset_ticks > 0:
+            bid_px = q_price(bid_px - tick * Decimal(bid_offset_ticks), "Bid")
+        if ask_offset_ticks > 0:
+            ask_px = q_price(ask_px + tick * Decimal(ask_offset_ticks), "Ask")
 
         # 库存偏移 & 硬阈暂停
         eb, ea, pause_bid, pause_ask = self.compute_skew_and_pause()
@@ -550,10 +835,19 @@ class WSBookTicker:
             self.ask_order_id = None
 
         self.last_quote_ms = now
-        print(f"[INV] pos={pos} eb={eb} ea={ea} pause(bid={pause_bid},ask={pause_ask}) -> bid={bid_px}, ask={ask_px}")
+        depth_tag = "-"
+        if depth_fresh is not None:
+            depth_tag = f"{format(depth_fresh.total_bid, 'f')}/{format(depth_fresh.total_ask, 'f')}"
+        trade_tag = "-"
+        if trade_fresh is not None:
+            trade_tag = f"imb={trade_fresh.imbalance:.2f} vol={format(trade_fresh.total_volume, 'f')}"
+        print(
+            f"[INV] pos={pos} eb={eb} ea={ea} pause(bid={pause_bid},ask={pause_ask}) "
+            f"depth={depth_tag} trades={trade_tag} -> bid={bid_px}, ask={ask_px}"
+        )
 
         # 主动 reduceOnly 对冲（放在最后执行）
-        self.maybe_hedge()
+        self.maybe_hedge(depth_snapshot=depth_fresh, trade_snapshot=trade_fresh)
 
 # ---------------------- 主流程 ----------------------
 BOT = WSBookTicker(SYMBOL)
@@ -575,3 +869,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
