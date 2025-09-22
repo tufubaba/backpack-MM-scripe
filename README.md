@@ -1,8 +1,8 @@
-# Backpack Scalper
+# Backpack MMbot
 
 ## 项目简介
 
-Backpack Scalper 是一个用于自动化交易的机器人，旨在连接到 Backpack 交易所，通过 WebSocket 和 REST API 实现市场数据处理、下单、撤单以及对冲策略。该项目旨在帮助用户在加密货币市场中进行高效的交易。
+Backpack MMbot 是一个用于自动化交易的机器人，旨在连接到 Backpack 交易所，通过 WebSocket 和 REST API 实现市场数据处理、下单、撤单以及对冲策略。该项目旨在帮助用户在加密货币市场中进行高效的交易。
 
 ## 文件结构
 
